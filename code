@@ -1,229 +1,355 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <Wire.h>
+#include <Adafruit_SHT4x.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
 
-#define LD2450_RX 16
-#define LD2450_TX 17
+// WIFI
+const char* ssid = "rohaniwilson";
+const char* password = "salimfaiz1234";
 
-HardwareSerial ld2450(2);
+// MQTT
+const char* mqtt_server = "broker.hivemq.com";
+const int mqtt_port = 1883;
+const char* mqtt_topic = "esp32s3/robot";
 
-// ===== BLE SETTINGS =====
-#define BLE_NAME "ESP32_LD2450"
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// BLE
+BLECharacteristic *sensorCharacteristic;
+bool bleConnected = false;
 
 #define SERVICE_UUID        "12345678"
 #define CHARACTERISTIC_UUID "abcd1234"
 
-BLECharacteristic *pCharacteristic;
-bool phoneConnected = false;
-
-// ===== LD2450 FRAME =====
-#define FRAME_SIZE 30
-uint8_t frame[FRAME_SIZE];
-int frameIndex = 0;
-
-// ===== DETECTION DATA =====
-bool humanDetected = false;
-float closestDistance = 0.0;
-unsigned long lastBleSend = 0;
-
-// =====================================================
-// BLE CALLBACK
-// =====================================================
 class MyServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer* pServer) {
-    phoneConnected = true;
-    Serial.println("Phone connected by BLE");
+    bleConnected = true;
+    Serial.println("BLE connected");
   }
 
   void onDisconnect(BLEServer* pServer) {
-    phoneConnected = false;
-    Serial.println("Phone disconnected");
+    bleConnected = false;
+    Serial.println("BLE disconnected");
     BLEDevice::startAdvertising();
   }
 };
 
-// =====================================================
-// DECODE LD2450 VALUE
-// =====================================================
-int16_t decodeLD2450(uint8_t lowByte, uint8_t highByte) {
-  uint16_t raw = lowByte | (highByte << 8);
-  int16_t value = raw & 0x7FFF;
+// SHT40
+#define SDA_PIN 8
+#define SCL_PIN 9
+Adafruit_SHT4x sht4;
+bool shtFound = false;
 
-  if (raw & 0x8000) {
-    return value;
+// HC-SR04P
+#define TRIG_PIN 4
+#define ECHO_PIN 5
+
+// LD2450
+#define LD2450_RX 16
+#define LD2450_TX 17
+HardwareSerial LD2450(1);
+
+// MOTOR PINS
+#define LEFT_IN1   10
+#define LEFT_IN2   11
+#define RIGHT_IN1  12
+#define RIGHT_IN2  13
+
+#define PWM_FREQ 20000
+#define PWM_RES 8
+
+// PID
+float targetDistance = 80.0;
+float Kp = 3.0;
+float Ki = 0.02;
+float Kd = 1.2;
+
+float error = 0;
+float previousError = 0;
+float integral = 0;
+
+int minSpeed = 60;
+int maxSpeed = 180;
+
+unsigned long lastControlTime = 0;
+unsigned long lastSend = 0;
+
+const unsigned long controlInterval = 100;
+const unsigned long sendInterval = 5000;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println("ESP32-S3 Robot Full System Started");
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  if (sht4.begin()) {
+    shtFound = true;
+    sht4.setPrecision(SHT4X_HIGH_PRECISION);
+    sht4.setHeater(SHT4X_NO_HEATER);
+    Serial.println("SHT40 found");
   } else {
-    return -value;
+    Serial.println("SHT40 not found");
+  }
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  LD2450.begin(256000, SERIAL_8N1, LD2450_RX, LD2450_TX);
+  Serial.println("LD2450 UART started");
+
+  setupMotors();
+  stopMotors();
+
+  setupWiFi();
+  client.setServer(mqtt_server, mqtt_port);
+
+  setupBLE();
+
+  Serial.println("System ready");
+}
+
+void loop() {
+  if (!client.connected()) {
+    reconnectMQTT();
+  }
+
+  client.loop();
+
+  if (millis() - lastControlTime >= controlInterval) {
+    lastControlTime = millis();
+    robotControl();
+  }
+
+  if (millis() - lastSend >= sendInterval) {
+    lastSend = millis();
+
+    String payload = makePayload();
+
+    Serial.println(payload);
+    client.publish(mqtt_topic, payload.c_str());
+
+    if (bleConnected) {
+      sensorCharacteristic->setValue(payload.c_str());
+      sensorCharacteristic->notify();
+    }
   }
 }
 
-// =====================================================
-// SETUP
-// =====================================================
-void setup() {
-  Serial.begin(115200);
-  delay(3000);
+// ================= ROBOT CONTROL =================
+void robotControl() {
+  float distanceCM = readUltrasonic();
 
-  Serial.println("================================");
-  Serial.println("ESP32-S3 + LD2450 + BLE STARTED");
-  Serial.println("================================");
+  if (distanceCM <= 0) {
+    stopMotors();
+    Serial.println("No object detected");
+    return;
+  }
 
-  // Start LD2450 UART
-  ld2450.begin(256000, SERIAL_8N1, LD2450_RX, LD2450_TX);
-  Serial.println("LD2450 UART started");
+  if (distanceCM < 25) {
+    stopMotors();
+    integral = 0;
+    Serial.println("Emergency stop: too close");
+    return;
+  }
 
-  // Start BLE
-  BLEDevice::init(BLE_NAME);
+  error = distanceCM - targetDistance;
+  integral += error;
+  integral = constrain(integral, -500, 500);
 
-  BLEServer *pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new MyServerCallbacks());
+  float derivative = error - previousError;
+  float pidOutput = (Kp * error) + (Ki * integral) + (Kd * derivative);
 
-  BLEService *pService = pServer->createService(SERVICE_UUID);
+  previousError = error;
 
-  pCharacteristic = pService->createCharacteristic(
+  int speedValue = constrain(abs(pidOutput), minSpeed, maxSpeed);
+
+  Serial.print("Distance: ");
+  Serial.print(distanceCM);
+  Serial.print(" cm | PID: ");
+  Serial.print(pidOutput);
+  Serial.print(" | Speed: ");
+  Serial.println(speedValue);
+
+  if (error > 5) {
+    moveForward(speedValue);
+  } else if (error < -5) {
+    moveBackward(speedValue);
+  } else {
+    stopMotors();
+  }
+}
+
+// ================= SENSOR PAYLOAD =================
+String makePayload() {
+  float temperature = 0;
+  float humidity = 0;
+  float ultrasonic = readUltrasonic();
+  String ldRaw = readLD2450RawShort();
+
+  if (shtFound) {
+    sensors_event_t humEvent;
+    sensors_event_t tempEvent;
+    sht4.getEvent(&humEvent, &tempEvent);
+
+    temperature = tempEvent.temperature;
+    humidity = humEvent.relative_humidity;
+  }
+
+  String payload = "{";
+  payload += "\"temperature\":";
+  payload += temperature;
+  payload += ",\"humidity\":";
+  payload += humidity;
+  payload += ",\"ultrasonic_cm\":";
+  payload += ultrasonic;
+  payload += ",\"target_distance\":";
+  payload += targetDistance;
+  payload += ",\"ld2450_raw\":\"";
+  payload += ldRaw;
+  payload += "\"}";
+
+  return payload;
+}
+
+// ================= HC-SR04P =================
+float readUltrasonic() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+
+  if (duration == 0) {
+    return -1;
+  }
+
+  return duration * 0.0343 / 2;
+}
+
+// ================= LD2450 RAW =================
+String readLD2450RawShort() {
+  String rawData = "";
+  int count = 0;
+
+  while (LD2450.available() && count < 40) {
+    byte b = LD2450.read();
+
+    if (b < 0x10) rawData += "0";
+    rawData += String(b, HEX);
+    rawData += " ";
+
+    count++;
+  }
+
+  if (rawData.length() == 0) {
+    rawData = "No data";
+  }
+
+  return rawData;
+}
+
+// ================= MOTOR SETUP =================
+void setupMotors() {
+  ledcAttach(LEFT_IN1, PWM_FREQ, PWM_RES);
+  ledcAttach(LEFT_IN2, PWM_FREQ, PWM_RES);
+  ledcAttach(RIGHT_IN1, PWM_FREQ, PWM_RES);
+  ledcAttach(RIGHT_IN2, PWM_FREQ, PWM_RES);
+}
+
+// ================= MOTOR FUNCTIONS =================
+void moveForward(int speedValue) {
+  ledcWrite(LEFT_IN1, speedValue);
+  ledcWrite(LEFT_IN2, 0);
+
+  ledcWrite(RIGHT_IN1, speedValue);
+  ledcWrite(RIGHT_IN2, 0);
+}
+
+void moveBackward(int speedValue) {
+  ledcWrite(LEFT_IN1, 0);
+  ledcWrite(LEFT_IN2, speedValue);
+
+  ledcWrite(RIGHT_IN1, 0);
+  ledcWrite(RIGHT_IN2, speedValue);
+}
+
+void stopMotors() {
+  ledcWrite(LEFT_IN1, 0);
+  ledcWrite(LEFT_IN2, 0);
+
+  ledcWrite(RIGHT_IN1, 0);
+  ledcWrite(RIGHT_IN2, 0);
+}
+
+// ================= WIFI =================
+void setupWiFi() {
+  Serial.print("Connecting to WiFi");
+
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("WiFi connected");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+// ================= MQTT =================
+void reconnectMQTT() {
+  while (!client.connected()) {
+    Serial.print("Connecting to MQTT...");
+
+    String clientId = "ESP32S3_Robot_";
+    clientId += String(random(0xffff), HEX);
+
+    if (client.connect(clientId.c_str())) {
+      Serial.println("connected");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.println(client.state());
+      delay(2000);
+    }
+  }
+}
+
+// ================= BLE =================
+void setupBLE() {
+  BLEDevice::init("ESP32S3_Robot");
+
+  BLEServer *server = BLEDevice::createServer();
+  server->setCallbacks(new MyServerCallbacks());
+
+  BLEService *service = server->createService(SERVICE_UUID);
+
+  sensorCharacteristic = service->createCharacteristic(
     CHARACTERISTIC_UUID,
     BLECharacteristic::PROPERTY_READ |
     BLECharacteristic::PROPERTY_NOTIFY
   );
 
-  pCharacteristic->addDescriptor(new BLE2902());
-  pCharacteristic->setValue("HUMAN:0 DIST:0.00");
+  sensorCharacteristic->addDescriptor(new BLE2902());
+  sensorCharacteristic->setValue("Waiting for robot data...");
 
-  pService->start();
+  service->start();
 
-  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-  pAdvertising->addServiceUUID(SERVICE_UUID);
-  pAdvertising->setScanResponse(true);
-  pAdvertising->start();
+  BLEAdvertising *advertising = BLEDevice::getAdvertising();
+  advertising->addServiceUUID(SERVICE_UUID);
+  advertising->start();
 
-  Serial.println("BLE started");
-  Serial.println("Device name: ESP32_LD2450");
-  Serial.println("Waiting for LD2450 data...");
-}
-
-// =====================================================
-// LOOP
-// =====================================================
-void loop() {
-  readLD2450();
-  sendBLE();
-}
-
-// =====================================================
-// READ LD2450 DATA
-// =====================================================
-void readLD2450() {
-  while (ld2450.available()) {
-    uint8_t b = ld2450.read();
-
-    if (frameIndex == 0) {
-      if (b == 0xAA) {
-        frame[frameIndex++] = b;
-      }
-      continue;
-    }
-
-    if (frameIndex == 1) {
-      if (b == 0xFF) {
-        frame[frameIndex++] = b;
-      } else {
-        frameIndex = 0;
-      }
-      continue;
-    }
-
-    frame[frameIndex++] = b;
-
-    if (frameIndex == FRAME_SIZE) {
-      frameIndex = 0;
-
-      if (frame[0] == 0xAA &&
-          frame[1] == 0xFF &&
-          frame[2] == 0x03 &&
-          frame[3] == 0x00 &&
-          frame[28] == 0x55 &&
-          frame[29] == 0xCC) {
-
-        parseLD2450();
-      }
-    }
-  }
-}
-
-// =====================================================
-// PARSE LD2450 TARGETS
-// =====================================================
-void parseLD2450() {
-  humanDetected = false;
-  closestDistance = 999.0;
-
-  Serial.println();
-  Serial.println("========== LD2450 DATA ==========");
-
-  for (int target = 0; target < 3; target++) {
-    int base = 4 + (target * 8);
-
-    int16_t x_mm = decodeLD2450(frame[base], frame[base + 1]);
-    int16_t y_mm = decodeLD2450(frame[base + 2], frame[base + 3]);
-    int16_t speed = decodeLD2450(frame[base + 4], frame[base + 5]);
-
-    if (x_mm == 0 && y_mm == 0) {
-      continue;
-    }
-
-    float x_m = x_mm / 1000.0;
-    float y_m = y_mm / 1000.0;
-    float distance = sqrt((x_m * x_m) + (y_m * y_m));
-
-    if (distance > 0.2 && distance < 6.0) {
-      humanDetected = true;
-
-      if (distance < closestDistance) {
-        closestDistance = distance;
-      }
-    }
-
-    Serial.print("Target ");
-    Serial.print(target + 1);
-    Serial.print(" | X: ");
-    Serial.print(x_mm);
-    Serial.print(" mm | Y: ");
-    Serial.print(y_mm);
-    Serial.print(" mm | Distance: ");
-    Serial.print(distance, 2);
-    Serial.print(" m | Speed: ");
-    Serial.println(speed);
-  }
-
-  if (!humanDetected) {
-    closestDistance = 0.0;
-  }
-
-  Serial.print("FINAL DATA -> HUMAN:");
-  Serial.print(humanDetected ? 1 : 0);
-  Serial.print(" DIST:");
-  Serial.print(closestDistance, 2);
-  Serial.println(" m");
-}
-
-// =====================================================
-// SEND DATA TO PHONE BY BLE
-// =====================================================
-void sendBLE() {
-  if (!phoneConnected) return;
-
-  if (millis() - lastBleSend >= 500) {
-    lastBleSend = millis();
-
-    String data = "HUMAN:";
-    data += humanDetected ? "1" : "0";
-    data += " DIST:";
-    data += String(closestDistance, 2);
-
-    pCharacteristic->setValue(data.c_str());
-    pCharacteristic->notify();
-
-    Serial.print("BLE SENT -> ");
-    Serial.println(data);
-  }
+  Serial.println("BLE started. Search for ESP32S3_Robot");
 }
