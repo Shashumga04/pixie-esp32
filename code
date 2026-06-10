@@ -1,24 +1,24 @@
 #include <WiFi.h>
-#include <PubSubClient.h>
 #include <Wire.h>
 #include <Adafruit_SHT4x.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include "ThingSpeak.h"  // Official MathWorks ThingSpeak Library
 
-// WIFI
-const char* ssid = "rohaniwilson";
-const char* password = "salimfaiz1234";
+// ================= CREDENTIALS CONFIGURATION =================
+// WIFI (Ensure this is a 2.4GHz network)
+const char* ssid = "CHAN MOOI LOONG"; 
+const char* password = "0162388832";
 
-// MQTT
-const char* mqtt_server = "broker.hivemq.com";
-const int mqtt_port = 1883;
-const char* mqtt_topic = "esp32s3/robot";
+// THINKSPEAK CONFIGURATION (Using official library parameters)
+unsigned long myChannelNumber = 3403474;         // Your numeric Channel ID
+const char* myWriteAPIKey = "K3JTOQ83W9QLU8RA";   // Your 16-character Write API Key
 
-WiFiClient espClient;
-PubSubClient client(espClient);
+WiFiClient client;  // Required network client instance for ThingSpeak.h
 
+// ================= PERIPHERAL SETTINGS =================
 // BLE
 BLECharacteristic *sensorCharacteristic;
 bool bleConnected = false;
@@ -80,8 +80,20 @@ unsigned long lastControlTime = 0;
 unsigned long lastSend = 0;
 
 const unsigned long controlInterval = 100;
-const unsigned long sendInterval = 5000;
+const unsigned long sendInterval = 16000; // Bumped to 16s to comfortably clear ThingSpeak's 15s limit
 
+// ================= FUNCTION PROTOTYPES =================
+void setupMotors();
+void stopMotors();
+void moveForward(int speedValue);
+void moveBackward(int speedValue);
+void setupWiFi();
+void setupBLE();
+void robotControl();
+float readUltrasonic();
+String readLD2450RawShort();
+
+// ================= SETUP =================
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -108,36 +120,79 @@ void setup() {
   setupMotors();
   stopMotors();
 
+  // Runs the advanced Wi-Fi configuration with deep flash resetting
   setupWiFi();
-  client.setServer(mqtt_server, mqtt_port);
+  
+  // Initialize ThingSpeak API engine using the network client wrapper
+  ThingSpeak.begin(client);
 
   setupBLE();
 
   Serial.println("System ready");
 }
 
+// ================= MAIN LOOP =================
 void loop() {
-  if (!client.connected()) {
-    reconnectMQTT();
-  }
-
-  client.loop();
-
+  // 1. FAST LOOP: High-speed PID tracking and motor controls (Every 100ms)
   if (millis() - lastControlTime >= controlInterval) {
     lastControlTime = millis();
     robotControl();
   }
 
+  // 2. SLOW LOOP: Non-blocking cloud updates (Every 16 seconds)
   if (millis() - lastSend >= sendInterval) {
     lastSend = millis();
 
-    String payload = makePayload();
+    // Background Auto-Reconnect check: Avoids hanging the code if WiFi dropped
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("\n[WARNING]: WiFi connection lost! Initiating background reconnection...");
+      WiFi.begin(ssid, password); 
+    }
 
-    Serial.println(payload);
-    client.publish(mqtt_topic, payload.c_str());
+    // Gather local sensor measurements
+    float temperature = 0;
+    float humidity = 0;
+    float ultrasonic = readUltrasonic();
 
+    if (shtFound) {
+      sensors_event_t humEvent;
+      sensors_event_t tempEvent;
+      sht4.getEvent(&humEvent, &tempEvent);
+      temperature = tempEvent.temperature;
+      humidity = humEvent.relative_humidity;
+    }
+
+    // Print diagnostics to local serial monitor
+    Serial.println("\n--- Sending Multi-Field Stream to ThingSpeak ---");
+    Serial.print("Temp: "); Serial.print(temperature);
+    Serial.print(" | Hum: "); Serial.print(humidity);
+    Serial.print(" | Dist: "); Serial.println(ultrasonic);
+
+    // Stage field values inside the ThingSpeak buffer memory
+    ThingSpeak.setField(1, temperature);
+    ThingSpeak.setField(2, humidity);
+    ThingSpeak.setField(3, ultrasonic);
+
+    // Push the staged fields to the cloud if the network is healthy
+    if (WiFi.status() == WL_CONNECTED) {
+      int responseCode = ThingSpeak.writeFields(myChannelNumber, myWriteAPIKey);
+      
+      if (responseCode == 200) {
+        Serial.println("ThingSpeak Upload Successful! (HTTP 200)");
+      } else {
+        Serial.print("ThingSpeak Upload Failed! HTTP/Error Code: ");
+        Serial.println(responseCode);
+        // Useful debugging codes: 
+        // -301 to -304 means throttled/rate-limited (sending too fast)
+      }
+    } else {
+      Serial.println("ThingSpeak Skipped: Network connection is down.");
+    }
+
+    // Simultaneously echo the data layout to any connected Bluetooth dashboard
     if (bleConnected) {
-      sensorCharacteristic->setValue(payload.c_str());
+      String blePayload = "field1=" + String(temperature) + "&field2=" + String(humidity) + "&field3=" + String(ultrasonic);
+      sensorCharacteristic->setValue(blePayload.c_str());
       sensorCharacteristic->notify();
     }
   }
@@ -185,38 +240,6 @@ void robotControl() {
   } else {
     stopMotors();
   }
-}
-
-// ================= SENSOR PAYLOAD =================
-String makePayload() {
-  float temperature = 0;
-  float humidity = 0;
-  float ultrasonic = readUltrasonic();
-  String ldRaw = readLD2450RawShort();
-
-  if (shtFound) {
-    sensors_event_t humEvent;
-    sensors_event_t tempEvent;
-    sht4.getEvent(&humEvent, &tempEvent);
-
-    temperature = tempEvent.temperature;
-    humidity = humEvent.relative_humidity;
-  }
-
-  String payload = "{";
-  payload += "\"temperature\":";
-  payload += temperature;
-  payload += ",\"humidity\":";
-  payload += humidity;
-  payload += ",\"ultrasonic_cm\":";
-  payload += ultrasonic;
-  payload += ",\"target_distance\":";
-  payload += targetDistance;
-  payload += ",\"ld2450_raw\":\"";
-  payload += ldRaw;
-  payload += "\"}";
-
-  return payload;
 }
 
 // ================= HC-SR04P =================
@@ -292,38 +315,42 @@ void stopMotors() {
   ledcWrite(RIGHT_IN2, 0);
 }
 
-// ================= WIFI =================
+// ================= WIFI WITH ANTI-REFUSAL DEEP RESET =================
 void setupWiFi() {
-  Serial.print("Connecting to WiFi");
+  Serial.println("Initializing Wi-Fi Radio Isolation Layer...");
+  
+  // 1. Force disconnect and wipe old configurations cached in flash memory
+  WiFi.disconnect(true, true); 
+  delay(1000); 
 
+  // 2. Explicitly pin the hardware mode to Station Mode (Client mode)
+  WiFi.mode(WIFI_STA);
+  delay(500);
+
+  Serial.print("Connecting to WiFi Network: ");
+  Serial.println(ssid);
+  
+  // 3. Begin connection handshake
   WiFi.begin(ssid, password);
 
-  while (WiFi.status() != WL_CONNECTED) {
+  int attempts = 0;
+  // Let it attempt for a solid 15 seconds max (30 steps * 500ms)
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
     delay(500);
     Serial.print(".");
+    attempts++;
   }
 
-  Serial.println();
-  Serial.println("WiFi connected");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
-}
-
-// ================= MQTT =================
-void reconnectMQTT() {
-  while (!client.connected()) {
-    Serial.print("Connecting to MQTT...");
-
-    String clientId = "ESP32S3_Robot_";
-    clientId += String(random(0xffff), HEX);
-
-    if (client.connect(clientId.c_str())) {
-      Serial.println("connected");
-    } else {
-      Serial.print("failed, rc=");
-      Serial.println(client.state());
-      delay(2000);
-    }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.println("WiFi connected successfully!");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println();
+    Serial.print("WiFi Handshake Terminated. Code: ");
+    Serial.println(WiFi.status());
+    Serial.println("Booting robot in local offline/BLE monitoring mode.");
   }
 }
 
@@ -343,7 +370,7 @@ void setupBLE() {
   );
 
   sensorCharacteristic->addDescriptor(new BLE2902());
-  sensorCharacteristic->setValue("Waiting for robot data...");
+  sensorCharacteristic->setValue("Waiting for field data configuration...");
 
   service->start();
 
@@ -351,5 +378,5 @@ void setupBLE() {
   advertising->addServiceUUID(SERVICE_UUID);
   advertising->start();
 
-  Serial.println("BLE started. Search for ESP32S3_Robot");
+  Serial.println("BLE System Armed. Scan for 'ESP32S3_Robot'");
 }
