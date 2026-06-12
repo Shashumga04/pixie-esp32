@@ -391,10 +391,11 @@ void setupBLE() {
   sensorCharacteristic = service->createCharacteristic(
     CHARACTERISTIC_UUID,
     BLECharacteristic::PROPERTY_READ |
-    BLECharacteristic::PROPERTY_NOTIFY
+    BLECharacteristic::PROPERTY_NOTIFY // This automatically handles the 2902 descriptor!
   );
 
-  sensorCharacteristic->addDescriptor(new BLE2902());
+  // REMOVED: sensorCharacteristic->addDescriptor(new BLE2902());
+  
   sensorCharacteristic->setValue("Waiting for data...");
   service->start();
 
