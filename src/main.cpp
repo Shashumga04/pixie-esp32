@@ -7,9 +7,7 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include "ThingSpeak.h"  // Official MathWorks ThingSpeak Library
-#include <LD2450.hpp>
-
-using namespace esphome::ld245x;
+#include <LD2450.h>
 
 // ================= CREDENTIALS CONFIGURATION =================
 const char* ssid = "smarthome_"; 
@@ -55,13 +53,12 @@ bool shtFound = false;
 #define LD2450_RX 17
 #define LD2450_TX 18
 
-HardwareSerial ld2450Serial(2);
-LD2450 ld2450;
-
 #define A_IN1 6
 #define B_IN1 7
 #define A_IN2 15
 #define B_IN2 16
+
+LD2450 ld2450;
 
 // MOTOR PINS
 #define LEFT_IN1 10
@@ -74,15 +71,16 @@ LD2450 ld2450;
 #define PWM_RES 8
 
 // DISTANCE THRESHOLDS & MOTOR SPEED
-const float targetDistance = 80.0;
+const float targetDistance = 30.0;
 const float deadband = 5.0; // Maintain target within +/- 5cm
 const int motorSpeed = 120; // Fixed cruising speed (Value between 0-255)
 
 unsigned long lastControlTime = 0;
 unsigned long lastSend = 0;
 
-const unsigned long controlInterval = 100;
-const unsigned long sendInterval = 16000; 
+// Fast control loop interval (ms). Increased to reduce control frequency.
+const unsigned long controlInterval = 1000;
+const unsigned long sendInterval = 10000; 
 
 // ================= FUNCTION PROTOTYPES =================
 void setupMotors();
@@ -117,34 +115,13 @@ void setup() {
   pinMode(ECHO_PIN, INPUT);
 
 // ld2450 start
-    ld2450Serial.begin(
+    Serial2.begin(
       9600,
       SERIAL_8N1,
       LD2450_RX,
       LD2450_TX
     );
-
-  ld2450Serial.setTimeout(1000);
-
-  ld2450.begin(ld2450Serial);
-
-  Serial.println("LD2450 initializing...");
-
-  ld2450.beginConfigurationSession();
-  ld2450.setMultiTargetTracking();
-  ld2450.queryTargetTrackingMode();
-  ld2450.queryFirmwareVersion();
-  ld2450.queryMacAddress();
-  ld2450.queryZoneFilter();
-  ld2450.endConfigurationSession();
-
-
-  Serial.print("Firmware: ");
-  Serial.println(ld2450.getFirmwareString());
-
-  Serial.print("MAC: ");
-  Serial.println(ld2450.getMacAddressString());
-
+  ld2450.begin(Serial2, false);
   Serial.println("LD2450 ready");
   
 // ld2450 end
@@ -274,18 +251,34 @@ float readUltrasonic() {
 // ================= LD2450 =================
 void readLD2450Distance()
 {
-    if (!ld2450.update())
-        return;
 
-    int targetCount = ld2450.getNrValidTargets();
+  // READ FUNCTION MUST BE CALLED IN LOOP TO READ THE INCOMMING DATA STREAM
+  if (ld2450.read() > 0)
+  {
 
-    while (targetCount > 0)
+    /*
+    PRINT DEBUG DATA STREAM LIKE THIS: 
+    TARGET ID=1 X=-19mm, Y=496mm, SPEED=0cm/s, RESOLUTION=360mm, DISTANCE=496mm, VALID=1
+    TARGET ID=2 X=-1078mm, Y=1370mm, SPEED=0cm/s, RESOLUTION=360mm, DISTANCE=1743mm, VALID=1
+    TARGET ID=3 X=0mm, Y=0mm, SPEED=0cm/s, RESOLUTION=0mm, DISTANCE=0mm, VALID=0
+    */
+    Serial.print(ld2450.getLastTargetMessage());
+
+
+    // GET THE DETECTED TARGETS
+    // TARGET RANGE CAN BE FROM 0 TO ld2450.getSensorSupportedTargetCount(), DEPENDS ON SENSOR HARDWARE. REFER TO LD2450 DATASHEET
+    bool anyMoving = false;
+    for (int i = 0; i < ld2450.getSensorSupportedTargetCount(); i++)
     {
-        targetCount--;
-
-        auto target = ld2450.getTarget(targetCount);
-        Serial.println(target.format().c_str());
+      const LD2450::RadarTarget result_target = ld2450.getTarget(i);
+      // CHECK IF THE TARGET IS MOVING
+      // SEE LD2450.h RadarTarget FOR ALL POSSIBLE TARGET DATA SUCH AS X, Y POSITION, DISTANCE,...
+      if (result_target.valid && abs(result_target.speed) > 0) // SENSOR SUPPORTS NEGATIVE SPEED IF MOVING TOWARDS SENSOR
+      {
+        Serial.println("TARGET DETECTED");
+      }
     }
+  }
 }
 
 // ================= MOTOR SETUP =================
