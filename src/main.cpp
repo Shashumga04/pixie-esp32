@@ -58,13 +58,18 @@ bool shtFound = false;
 HardwareSerial ld2450Serial(2);
 LD2450 ld2450;
 
+#define A_IN1 6
+#define B_IN1 7
+#define A_IN2 15
+#define B_IN2 16
+
 // MOTOR PINS
-#define LEFT_IN1   10
-#define RIGHT_IN1  12
-#define LEFT_IN2   11
-#define RIGHT_IN2  13
-#define ENABLE     14
-        
+#define LEFT_IN1 10
+#define LEFT_IN2 11
+#define RIGHT_IN1 12
+#define RIGHT_IN2 13
+#define ENABLE 14
+
 #define PWM_FREQ 20000
 #define PWM_RES 8
 
@@ -112,12 +117,12 @@ void setup() {
   pinMode(ECHO_PIN, INPUT);
 
 // ld2450 start
-  ld2450Serial.begin(
-      LD2450_SERIAL_SPEED,
+    ld2450Serial.begin(
+      9600,
       SERIAL_8N1,
       LD2450_RX,
       LD2450_TX
-  );
+    );
 
   ld2450Serial.setTimeout(1000);
 
